@@ -39,7 +39,7 @@
             enable = lib.mkEnableOption "Tangle daemon";
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.default;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
               description = "The tangle package to use.";
             };
             actions = lib.mkOption {
@@ -74,7 +74,7 @@
             enable = lib.mkEnableOption "Tangle daemon";
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.default;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
               description = "The tangle package to use.";
             };
             actions = lib.mkOption {
