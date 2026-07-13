@@ -3,38 +3,53 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs =
+    { self, nixpkgs }:
+    let 
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+    in
     {
-      self,
-      nixpkgs,
-      flake-utils,
-    }:
-    (flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-      in
-      {
-        packages.default = pkgs.callPackage ./package.nix { };
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            go
-            gcc
-          ];
-        };
-      }
-    ))
-    // {
-      nixosModules.default = { config, lib, pkgs, ... }: 
+      packages = forAllSystems (system: {
+        default = nixpkgs.legacyPackages.${system}.callPackage ./package.nix { };
+      });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              go
+              gcc
+            ];
+          };
+        }
+      );
+
+      nixosModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         let
           cfg = config.services.tangle;
           yamlConfig = pkgs.writers.writeYAML "config.yaml" {
             actions = cfg.actions;
           };
-        in {
+        in
+        {
           options.services.tangle = {
             enable = lib.mkEnableOption "Tangle daemon";
             package = lib.mkOption {
@@ -44,7 +59,7 @@
             };
             actions = lib.mkOption {
               type = lib.types.listOf lib.types.attrs;
-              default = [];
+              default = [ ];
               description = "List of action hooks.";
             };
           };
@@ -56,20 +71,27 @@
               description = "tangle daemon";
               wantedBy = [ "multi-user.target" ];
               after = [ "dbus.service" ];
-              
+
               serviceConfig = {
                 ExecStart = "${cfg.package}/bin/tangle";
                 Restart = "on-failure";
-                RestrictAddressFamilies = [ "AF_UNIX" ]; 
+                RestrictAddressFamilies = [ "AF_UNIX" ];
               };
             };
           };
         };
 
-      hmModules.default = { config, lib, pkgs, ... }:
+      hmModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         let
           cfg = config.services.tangle;
-        in {
+        in
+        {
           options.services.tangle = {
             enable = lib.mkEnableOption "Tangle daemon";
             package = lib.mkOption {
@@ -79,13 +101,13 @@
             };
             actions = lib.mkOption {
               type = lib.types.listOf lib.types.attrs;
-              default = [];
+              default = [ ];
               description = "List of action hooks.";
             };
           };
 
           config = lib.mkIf cfg.enable {
-            xdg.configFile."tangle/config.yaml".text = lib.generators.toYAML {} {
+            xdg.configFile."tangle/config.yaml".text = lib.generators.toYAML { } {
               actions = cfg.actions;
             };
 
