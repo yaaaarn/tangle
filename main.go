@@ -211,6 +211,8 @@ func main() {
 	monitor := NewMonitor(bus)
 
 	actionTriggered := make(map[int]bool)
+	lastTriggered := make(map[int]time.Time)
+	const cooldown = 30 * time.Second
 
 	go func() {
 		events := bus.Subscribe()
@@ -234,9 +236,10 @@ func main() {
 				}
 
 				if match {
-					if !actionTriggered[idx] {
+					if !actionTriggered[idx] || time.Since(lastTriggered[idx]) > cooldown {
 						executeCommand(action, event)
 						actionTriggered[idx] = true
+						lastTriggered[idx] = time.Now()
 					}
 				} else {
 					actionTriggered[idx] = false
