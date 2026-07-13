@@ -70,6 +70,57 @@ func NewMonitor(bus *EventBus) *Monitor {
 	return &Monitor{bus: bus}
 }
 
+// batteryStateFromEnum maps the UPower Device.State enum to our BatteryState type.
+func batteryStateFromEnum(v uint32) BatteryState {
+	switch v {
+	case 1:
+		return "Charging"
+	case 2:
+		return "Discharging"
+	case 4:
+		return "Full"
+	default:
+		return "Unknown"
+	}
+}
+
+// fetch performs a single, consistent read of the battery's percentage and
+// state. Both readState and fetchAndPublish used to exist separately and
+// issue their own independent GetProperty calls, which meant a state
+// transition could be observed differently by each call (a narrow race) and
+// wasted an extra D-Bus round trip. This is now the single source of truth.
+func (m *Monitor) fetch(conn *dbus.Conn, device dbus.ObjectPath) (BatteryEvent, error) {
+	batteryObj := conn.Object("org.freedesktop.UPower", device)
+
+	percentageVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.Percentage")
+	if err != nil {
+		return BatteryEvent{}, fmt.Errorf("failed to read percentage: %w", err)
+	}
+	stateVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.State")
+	if err != nil {
+		return BatteryEvent{}, fmt.Errorf("failed to read state: %w", err)
+	}
+
+	// Type-assert defensively. A bad assertion here used to panic and take
+	// down the whole daemon if UPower ever returned an unexpected variant
+	// type (e.g. during device hot-plug/teardown, or on a nonstandard
+	// implementation).
+	percentF, ok := percentageVar.Value().(float64)
+	if !ok {
+		return BatteryEvent{}, fmt.Errorf("unexpected type for Percentage: %T", percentageVar.Value())
+	}
+	stateEnum, ok := stateVar.Value().(uint32)
+	if !ok {
+		return BatteryEvent{}, fmt.Errorf("unexpected type for State: %T", stateVar.Value())
+	}
+
+	return BatteryEvent{
+		Percentage: int(percentF),
+		State:      batteryStateFromEnum(stateEnum),
+		Timestamp:  time.Now(),
+	}, nil
+}
+
 func (m *Monitor) Start(ctx context.Context) error {
 	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
@@ -84,6 +135,15 @@ func (m *Monitor) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to get battery device: %w", err)
 	}
 
+	// Register the channel with the connection BEFORE adding the match
+	// rule. Previously AddMatch ran first, which opened a narrow window
+	// where the bus could start routing matching signals to this
+	// connection before anything was listening on c, silently dropping
+	// them.
+	c := make(chan *dbus.Signal, 10)
+	conn.Signal(c)
+	defer conn.RemoveSignal(c)
+
 	rule := fmt.Sprintf(
 		"type='signal',sender='org.freedesktop.UPower',path='%s',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
 		displayDevice,
@@ -92,78 +152,46 @@ func (m *Monitor) Start(ctx context.Context) error {
 	if call.Err != nil {
 		return fmt.Errorf("failed to register dbus match rule: %w", call.Err)
 	}
+	defer conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
 
-	c := make(chan *dbus.Signal, 10)
-	conn.Signal(c)
-
-	m.fetchAndPublish(conn, displayDevice)
-	lastState := m.readState(conn, displayDevice)
+	initial, err := m.fetch(conn, displayDevice)
+	if err != nil {
+		return fmt.Errorf("failed initial battery read: %w", err)
+	}
+	m.bus.Publish(initial)
+	lastState := initial.State
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-c:
-			currentState := m.readState(conn, displayDevice)
-			if currentState != lastState {
-				lastState = currentState
-				time.Sleep(1 * time.Second)
+			reading, err := m.fetch(conn, displayDevice)
+			if err != nil {
+				// Don't crash on a transient read failure; just skip
+				// this event and wait for the next signal.
+				continue
 			}
-			m.fetchAndPublish(conn, displayDevice)
+
+			if reading.State != lastState {
+				lastState = reading.State
+				// Give UPower a moment for the percentage to settle
+				// after a state transition, but stay responsive to
+				// shutdown instead of blocking unconditionally.
+				select {
+				case <-time.After(1 * time.Second):
+				case <-ctx.Done():
+					return nil
+				}
+				reading, err = m.fetch(conn, displayDevice)
+				if err != nil {
+					continue
+				}
+			}
+
+			m.bus.Publish(reading)
 		}
 	}
-}
-
-func (m *Monitor) readState(conn *dbus.Conn, device dbus.ObjectPath) BatteryState {
-	batteryObj := conn.Object("org.freedesktop.UPower", device)
-	stateVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.State")
-	if err != nil {
-		return ""
-	}
-	switch stateVar.Value().(uint32) {
-	case 1:
-		return "Charging"
-	case 2:
-		return "Discharging"
-	case 4:
-		return "Full"
-	default:
-		return "Unknown"
-	}
-}
-
-func (m *Monitor) fetchAndPublish(conn *dbus.Conn, device dbus.ObjectPath) {
-	batteryObj := conn.Object("org.freedesktop.UPower", device)
-
-	percentageVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.Percentage")
-	if err != nil {
-		return
-	}
-	stateVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.State")
-	if err != nil {
-		return
-	}
-
-	percent := int(percentageVar.Value().(float64))
-	stateEnum := stateVar.Value().(uint32)
-
-	var state BatteryState
-	switch stateEnum {
-	case 1:
-		state = "Charging"
-	case 2:
-		state = "Discharging"
-	case 4:
-		state = "Full"
-	default:
-		state = "Unknown"
-	}
-
-	m.bus.Publish(BatteryEvent{
-		Percentage: percent,
-		State:      state,
-		Timestamp:  time.Now(),
-	})
 }
 
 func executeCommand(action ActionConfig, event BatteryEvent) {
@@ -234,8 +262,19 @@ func main() {
 	bus := NewEventBus()
 	monitor := NewMonitor(bus)
 
+	// actionTriggered and lastMatchedAt are only ever read/written from
+	// within the single event-processing goroutine below, so no
+	// additional locking is required for them.
+	//
+	// actionTriggered tracks whether an action has already fired for the
+	// current "streak" of matching events, so it fires once per streak
+	// instead of repeatedly for as long as the condition holds true.
+	// lastMatchedAt tracks the last time the action's condition matched,
+	// so a brief flicker below the cooldown window (e.g. a percentage
+	// reading bouncing across a threshold) doesn't count as the streak
+	// ending and re-arm the action.
 	actionTriggered := make(map[int]bool)
-	lastTriggered := make(map[int]time.Time)
+	lastMatchedAt := make(map[int]time.Time)
 	const cooldown = 30 * time.Second
 
 	go func() {
@@ -243,7 +282,9 @@ func main() {
 		for event := range events {
 			for idx, action := range cfg.Actions {
 				if string(event.State) != action.TriggerOnState {
-					actionTriggered[idx] = false
+					if actionTriggered[idx] && time.Since(lastMatchedAt[idx]) > cooldown {
+						actionTriggered[idx] = false
+					}
 					continue
 				}
 
@@ -260,12 +301,12 @@ func main() {
 				}
 
 				if match {
-					if !actionTriggered[idx] || time.Since(lastTriggered[idx]) > cooldown {
+					if !actionTriggered[idx] {
 						executeCommand(action, event)
 						actionTriggered[idx] = true
-						lastTriggered[idx] = time.Now()
 					}
-				} else {
+					lastMatchedAt[idx] = time.Now()
+				} else if actionTriggered[idx] && time.Since(lastMatchedAt[idx]) > cooldown {
 					actionTriggered[idx] = false
 				}
 			}
