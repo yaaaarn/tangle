@@ -97,14 +97,38 @@ func (m *Monitor) Start(ctx context.Context) error {
 	conn.Signal(c)
 
 	m.fetchAndPublish(conn, displayDevice)
+	lastState := m.readState(conn, displayDevice)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-c:
+			currentState := m.readState(conn, displayDevice)
+			if currentState != lastState {
+				lastState = currentState
+				time.Sleep(1 * time.Second)
+			}
 			m.fetchAndPublish(conn, displayDevice)
 		}
+	}
+}
+
+func (m *Monitor) readState(conn *dbus.Conn, device dbus.ObjectPath) BatteryState {
+	batteryObj := conn.Object("org.freedesktop.UPower", device)
+	stateVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.State")
+	if err != nil {
+		return ""
+	}
+	switch stateVar.Value().(uint32) {
+	case 1:
+		return "Charging"
+	case 2:
+		return "Discharging"
+	case 4:
+		return "Full"
+	default:
+		return "Unknown"
 	}
 }
 
