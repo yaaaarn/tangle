@@ -1,6 +1,6 @@
 # ⚡ tangle
 
-a battery monitor daemon. listens to upower events over dbus and fires configurable commands.
+a battery monitor daemon. polls `/sys/class/power_supply` and fires configurable commands.
 
 ## table of contents
 

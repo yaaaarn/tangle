@@ -70,7 +70,6 @@
             systemd.services.tangle = {
               description = "tangle daemon";
               wantedBy = [ "multi-user.target" ];
-              after = [ "dbus.service" ];
 
               serviceConfig = {
                 ExecStart = "${cfg.package}/bin/tangle";

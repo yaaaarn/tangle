@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,9 +13,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/godbus/dbus/v5"
 	"gopkg.in/yaml.v3"
 )
+
+var debug bool
+
+func init() {
+	flag.BoolVar(&debug, "debug", false, "enable debug logging")
+	flag.Parse()
+}
+
+var logger = log.New(os.Stdout, "[tangle] ", log.LstdFlags|log.Lshortfile)
+
+func logf(format string, v ...any) {
+	if debug {
+		logger.Printf(format, v...)
+	}
+}
 
 type BatteryState string
 
@@ -63,130 +79,165 @@ func (eb *EventBus) Publish(event BatteryEvent) {
 }
 
 type Monitor struct {
-	bus *EventBus
+	bus           *EventBus
+	batteryDir    string
+	acDir         string
+	pollInterval  time.Duration
+	stateDebounce int
+	lastStates    []BatteryState
 }
 
 func NewMonitor(bus *EventBus) *Monitor {
-	return &Monitor{bus: bus}
-}
-
-// batteryStateFromEnum maps the UPower Device.State enum to our BatteryState type.
-func batteryStateFromEnum(v uint32) BatteryState {
-	switch v {
-	case 1:
-		return "Charging"
-	case 2:
-		return "Discharging"
-	case 4:
-		return "Full"
-	default:
-		return "Unknown"
+	return &Monitor{
+		bus:           bus,
+		pollInterval:  1 * time.Second,
+		stateDebounce: 3, // reads before accepting a state change
+		lastStates:    make([]BatteryState, 0, 3),
 	}
 }
 
-// fetch performs a single, consistent read of the battery's percentage and
-// state. Both readState and fetchAndPublish used to exist separately and
-// issue their own independent GetProperty calls, which meant a state
-// transition could be observed differently by each call (a narrow race) and
-// wasted an extra D-Bus round trip. This is now the single source of truth.
-func (m *Monitor) fetch(conn *dbus.Conn, device dbus.ObjectPath) (BatteryEvent, error) {
-	batteryObj := conn.Object("org.freedesktop.UPower", device)
-
-	percentageVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.Percentage")
+func (m *Monitor) findBatteryAndAC() error {
+	logf("scanning /sys/class/power_supply for battery and AC devices")
+	entries, err := os.ReadDir("/sys/class/power_supply")
 	if err != nil {
-		return BatteryEvent{}, fmt.Errorf("failed to read percentage: %w", err)
-	}
-	stateVar, err := batteryObj.GetProperty("org.freedesktop.UPower.Device.State")
-	if err != nil {
-		return BatteryEvent{}, fmt.Errorf("failed to read state: %w", err)
+		return fmt.Errorf("failed to read /sys/class/power_supply: %w", err)
 	}
 
-	// Type-assert defensively. A bad assertion here used to panic and take
-	// down the whole daemon if UPower ever returned an unexpected variant
-	// type (e.g. during device hot-plug/teardown, or on a nonstandard
-	// implementation).
-	percentF, ok := percentageVar.Value().(float64)
-	if !ok {
-		return BatteryEvent{}, fmt.Errorf("unexpected type for Percentage: %T", percentageVar.Value())
+	for _, entry := range entries {
+		typePath := filepath.Join("/sys/class/power_supply", entry.Name(), "type")
+		typeBytes, err := os.ReadFile(typePath)
+		if err != nil {
+			continue
+		}
+		devType := strings.TrimSpace(string(typeBytes))
+		if devType == "Battery" && m.batteryDir == "" {
+			m.batteryDir = filepath.Join("/sys/class/power_supply", entry.Name())
+			logf("found battery: %s", m.batteryDir)
+		} else if devType == "Mains" && m.acDir == "" {
+			m.acDir = filepath.Join("/sys/class/power_supply", entry.Name())
+			logf("found AC adapter: %s", m.acDir)
+		}
 	}
-	stateEnum, ok := stateVar.Value().(uint32)
-	if !ok {
-		return BatteryEvent{}, fmt.Errorf("unexpected type for State: %T", stateVar.Value())
+
+	if m.batteryDir == "" {
+		return fmt.Errorf("no battery found in /sys/class/power_supply")
 	}
+	logf("using battery: %s, AC: %s", m.batteryDir, m.acDir)
+	return nil
+}
+
+func (m *Monitor) readBattery() (BatteryEvent, error) {
+	capacityBytes, err := os.ReadFile(filepath.Join(m.batteryDir, "capacity"))
+	if err != nil {
+		return BatteryEvent{}, fmt.Errorf("failed to read capacity: %w", err)
+	}
+	percentage, err := strconv.Atoi(strings.TrimSpace(string(capacityBytes)))
+	if err != nil {
+		return BatteryEvent{}, fmt.Errorf("failed to parse capacity: %w", err)
+	}
+
+	statusBytes, err := os.ReadFile(filepath.Join(m.batteryDir, "status"))
+	if err != nil {
+		return BatteryEvent{}, fmt.Errorf("failed to read status: %w", err)
+	}
+	status := strings.TrimSpace(string(statusBytes))
+
+	state := BatteryState(status)
+	if state == "Charging" || state == "Discharging" || state == "Full" || state == "Not charging" {
+	} else {
+		state = "Unknown"
+	}
+
+	logf("battery: %d%% %s", percentage, state)
 
 	return BatteryEvent{
-		Percentage: int(percentF),
-		State:      batteryStateFromEnum(stateEnum),
+		Percentage: percentage,
+		State:      state,
 		Timestamp:  time.Now(),
 	}, nil
 }
 
+func (m *Monitor) debouncedRead() (BatteryEvent, BatteryState, bool) {
+	reading, err := m.readBattery()
+	if err != nil {
+		return BatteryEvent{}, "", false
+	}
+
+	// Add to rolling window
+	m.lastStates = append(m.lastStates, reading.State)
+	if len(m.lastStates) > m.stateDebounce {
+		m.lastStates = m.lastStates[1:]
+	}
+
+	// Check if we have enough consistent readings
+	if len(m.lastStates) < m.stateDebounce {
+		return reading, reading.State, false // not enough samples yet
+	}
+
+	// Check if all recent states are the same
+	consistent := true
+	for _, s := range m.lastStates {
+		if s != m.lastStates[0] {
+			consistent = false
+			break
+		}
+	}
+
+	debouncedState := reading.State
+	if consistent {
+		debouncedState = m.lastStates[0]
+	}
+
+	return reading, debouncedState, consistent
+}
+
 func (m *Monitor) Start(ctx context.Context) error {
-	conn, err := dbus.ConnectSystemBus()
-	if err != nil {
-		return fmt.Errorf("failed to connect to system bus: %w", err)
-	}
-	defer conn.Close()
-
-	var displayDevice dbus.ObjectPath
-	obj := conn.Object("org.freedesktop.UPower", "/org/freedesktop/UPower")
-	err = obj.Call("org.freedesktop.UPower.GetDisplayDevice", 0).Store(&displayDevice)
-	if err != nil {
-		return fmt.Errorf("failed to get battery device: %w", err)
+	logf("starting battery monitor (poll interval: %v, debounce: %d)", m.pollInterval, m.stateDebounce)
+	if err := m.findBatteryAndAC(); err != nil {
+		return err
 	}
 
-	// Register the channel with the connection BEFORE adding the match
-	// rule. Previously AddMatch ran first, which opened a narrow window
-	// where the bus could start routing matching signals to this
-	// connection before anything was listening on c, silently dropping
-	// them.
-	c := make(chan *dbus.Signal, 10)
-	conn.Signal(c)
-	defer conn.RemoveSignal(c)
-
-	rule := fmt.Sprintf(
-		"type='signal',sender='org.freedesktop.UPower',path='%s',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
-		displayDevice,
-	)
-	call := conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule)
-	if call.Err != nil {
-		return fmt.Errorf("failed to register dbus match rule: %w", call.Err)
-	}
-	defer conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
-
-	initial, err := m.fetch(conn, displayDevice)
-	if err != nil {
-		return fmt.Errorf("failed initial battery read: %w", err)
+	var initial BatteryEvent
+	for i := 0; i < m.stateDebounce; i++ {
+		var err error
+		initial, err = m.readBattery()
+		if err != nil {
+			return fmt.Errorf("failed initial battery read: %w", err)
+		}
 	}
 	m.bus.Publish(initial)
 	lastState := initial.State
+	logf("initial state: %d%% %s", initial.Percentage, initial.State)
+
+	ticker := time.NewTicker(m.pollInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			logf("context cancelled, stopping monitor")
 			return nil
-		case <-c:
-			reading, err := m.fetch(conn, displayDevice)
-			if err != nil {
-				// Don't crash on a transient read failure; just skip
-				// this event and wait for the next signal.
+		case <-ticker.C:
+			reading, debouncedState, consistent := m.debouncedRead()
+			if !consistent {
 				continue
 			}
 
-			if reading.State != lastState {
-				lastState = reading.State
-				// Give UPower a moment for the percentage to settle
-				// after a state transition, but stay responsive to
-				// shutdown instead of blocking unconditionally.
+			if debouncedState != lastState {
+				logf("state changed: %s -> %s", lastState, debouncedState)
+				lastState = debouncedState
 				select {
-				case <-time.After(1 * time.Second):
+				case <-time.After(250 * time.Millisecond):
 				case <-ctx.Done():
 					return nil
 				}
-				reading, err = m.fetch(conn, displayDevice)
+				// Re-read after debounce to get fresh percentage
+				reading, err := m.readBattery()
 				if err != nil {
 					continue
 				}
+				// Use debounced state but fresh percentage
+				reading.State = debouncedState
 			}
 
 			m.bus.Publish(reading)
@@ -206,10 +257,11 @@ func executeCommand(action ActionConfig, event BatteryEvent) {
 		processedCmd[i] = arg
 	}
 
+	logf("executing command: %v", processedCmd)
 	go func() {
 		cmd := exec.Command(processedCmd[0], processedCmd[1:]...)
 		if err := cmd.Run(); err != nil {
-			fmt.Printf("command failed: %v (cmd: %s)\n", err, processedCmd[0])
+			logf("command failed: %v (cmd: %s)", err, processedCmd[0])
 		}
 	}()
 }
@@ -237,6 +289,7 @@ func loadConfig() (Config, string, error) {
 		fileBytes, err = os.ReadFile(path)
 		if err == nil {
 			finalPath = path
+			logf("loaded config from: %s", path)
 			break
 		}
 	}
@@ -250,29 +303,20 @@ func loadConfig() (Config, string, error) {
 		return cfg, finalPath, fmt.Errorf("failed to parse yaml from %s: %w", finalPath, err)
 	}
 
+	logf("loaded %d action(s)", len(cfg.Actions))
 	return cfg, finalPath, nil
 }
 
 func main() {
+	logf("starting tangle battery monitor")
 	cfg, _, err := loadConfig()
 	if err != nil {
-		panic(err)
+		logger.Fatalf("config error: %v", err)
 	}
 
 	bus := NewEventBus()
 	monitor := NewMonitor(bus)
 
-	// actionTriggered and lastMatchedAt are only ever read/written from
-	// within the single event-processing goroutine below, so no
-	// additional locking is required for them.
-	//
-	// actionTriggered tracks whether an action has already fired for the
-	// current "streak" of matching events, so it fires once per streak
-	// instead of repeatedly for as long as the condition holds true.
-	// lastMatchedAt tracks the last time the action's condition matched,
-	// so a brief flicker below the cooldown window (e.g. a percentage
-	// reading bouncing across a threshold) doesn't count as the streak
-	// ending and re-arm the action.
 	actionTriggered := make(map[int]bool)
 	lastMatchedAt := make(map[int]time.Time)
 	const cooldown = 30 * time.Second
@@ -280,14 +324,8 @@ func main() {
 	go func() {
 		events := bus.Subscribe()
 		for event := range events {
+			logf("received event: %d%% %s", event.Percentage, event.State)
 			for idx, action := range cfg.Actions {
-				if string(event.State) != action.TriggerOnState {
-					if actionTriggered[idx] && time.Since(lastMatchedAt[idx]) > cooldown {
-						actionTriggered[idx] = false
-					}
-					continue
-				}
-
 				match := false
 				switch action.Operator {
 				case "any":
@@ -300,8 +338,15 @@ func main() {
 					match = event.Percentage >= action.ThresholdPercentage
 				}
 
+				stateMatches := string(event.State) == action.TriggerOnState
+				if !stateMatches {
+					actionTriggered[idx] = false
+					continue
+				}
+
 				if match {
 					if !actionTriggered[idx] {
+						logf("action %d triggered: %v", idx, action.Command)
 						executeCommand(action, event)
 						actionTriggered[idx] = true
 					}
@@ -314,6 +359,6 @@ func main() {
 	}()
 
 	if err := monitor.Start(context.Background()); err != nil {
-		panic(err)
+		logger.Fatalf("monitor error: %v", err)
 	}
 }
