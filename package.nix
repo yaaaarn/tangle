@@ -8,7 +8,7 @@ buildGoModule {
 
   src = ./.;
 
-  vendorHash = "sha256-g7tMp2rWtAoWlx8NrWcwcKJpw7DFMtJzH5OLG8fsWlU=";
+  vendorHash = "sha256-g+yaVIx4jxpAQ/+WrGKxhVeliYx7nLQe/zsGpxV4Fn4=";
 
   meta = with lib; {
     description = "a battery monitor utility";
