@@ -91,7 +91,7 @@ func NewMonitor(bus *EventBus) *Monitor {
 	return &Monitor{
 		bus:           bus,
 		pollInterval:  1 * time.Second,
-		stateDebounce: 5, // reads before accepting a state change
+		stateDebounce: 10, // reads before accepting a state change
 		lastStates:    make([]BatteryState, 0, 3),
 	}
 }
